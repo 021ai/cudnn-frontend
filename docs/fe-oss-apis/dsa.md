@@ -470,6 +470,21 @@ result = DSA.dense_indexer_backward_wrapper(
 
 ---
 
+## Hybrid attention backward (SM90)
+
+`DSA.hybrid_attention_backward_wrapper` implements the HFA backward
+decomposition used by streaming indexing. It runs an explicit sink/learned
+sparse branch and an implicit bottom-right local-window Q2 branch against the
+same full-attention output and LSE, reusing the sparse branch preprocess.
+
+The initial implementation supports unpacked absorbed-MLA tensors with 32
+query heads, an even query length, QK width 512 or 576, and a positive local
+window. Explicit indices contain sink and learned tokens only; local positions
+are generated in the SM90 kernel.
+
+Sparse backward can additionally return the head-reduced CLI teacher target
+with `return_cli_target=True` and `cli_target_head_count=<real heads>`.
+
 ## Limitations
 
 - **Architecture support** — Sparse Attention Backward, Score Recompute,

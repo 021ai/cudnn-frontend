@@ -17,8 +17,6 @@ import cuda.bindings.driver as cuda
 
 from cudnn.api_base import APIBase, TupleDict
 
-from . import _interface_sm100 as _iface_sm100
-
 
 class SparseAttentionBackward(APIBase):
     def __init__(
@@ -35,6 +33,9 @@ class SparseAttentionBackward(APIBase):
         sample_topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         block_tile: int = 64,
+        return_cli_target: bool = False,
+        cli_target_head_count: Optional[int] = None,
+        return_preprocess_aux: bool = False,
     ):
         super().__init__()
         self.q_desc = self._make_tensor_desc(sample_q, name="sample_q")
@@ -47,6 +48,9 @@ class SparseAttentionBackward(APIBase):
         self.topk_length_desc = self._make_tensor_desc(sample_topk_length, name="sample_topk_length")
         self.block_tile = int(block_tile)
         self.softmax_scale = softmax_scale
+        self.return_cli_target = bool(return_cli_target)
+        self.cli_target_head_count = cli_target_head_count
+        self.return_preprocess_aux = bool(return_preprocess_aux)
 
     def check_support(self) -> bool:
         major, _ = torch.cuda.get_device_capability()
@@ -145,6 +149,21 @@ class SparseAttentionBackward(APIBase):
                 self.topk_length_desc.shape != (total_s_q,),
                 f"topk_length must have shape {(total_s_q,)}, got {self.topk_length_desc.shape}",
             )
+        if self.return_cli_target:
+            self._runtime_error_if(
+                major != 9,
+                f"Fused CLI target output is SM90-only, found SM{major}",
+            )
+            self._value_error_if(
+                self.q_desc.shape[1] != 64,
+                "Fused CLI target output requires one padded 64-head block, "
+                f"got Q shape {self.q_desc.shape}",
+            )
+            self._value_error_if(
+                self.cli_target_head_count is None
+                or not 0 < self.cli_target_head_count <= self.q_desc.shape[1],
+                "cli_target_head_count must be in (0, 64] when fused CLI output is enabled",
+            )
 
         self._is_supported = True
         return True
@@ -168,10 +187,34 @@ class SparseAttentionBackward(APIBase):
         dkv: Optional[torch.Tensor] = None,
         topk_length: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
+        return_cli_target: Optional[bool] = None,
+        cli_target_head_count: Optional[int] = None,
+        return_preprocess_aux: Optional[bool] = None,
         current_stream: Optional[cuda.CUstream] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         major, _ = torch.cuda.get_device_capability()
         scale = self.softmax_scale if softmax_scale is None else softmax_scale
+        want_cli_target = (
+            self.return_cli_target if return_cli_target is None else bool(return_cli_target)
+        )
+        want_preprocess_aux = (
+            self.return_preprocess_aux
+            if return_preprocess_aux is None
+            else bool(return_preprocess_aux)
+        )
+        real_head_count = (
+            self.cli_target_head_count
+            if cli_target_head_count is None
+            else cli_target_head_count
+        )
+        if want_cli_target and major != 9:
+            raise RuntimeError(
+                f"Fused CLI target output is SM90-only, found SM{major}"
+            )
+        if want_preprocess_aux and major != 9:
+            raise RuntimeError(
+                f"Backward preprocess auxiliary output is SM90-only, found SM{major}"
+            )
         if major == 9:
             from . import _interface_sm90 as _iface_sm90
 
@@ -188,8 +231,13 @@ class SparseAttentionBackward(APIBase):
                 dq=dq,
                 dkv=dkv,
                 need_d_sink=True,
+                return_cli_target=want_cli_target,
+                cli_target_head_count=real_head_count,
+                return_preprocess_aux=want_preprocess_aux,
                 current_stream=current_stream,
             )
+        from . import _interface_sm100 as _iface_sm100
+
         return _iface_sm100.flash_attn_bwd_sm100(
             q,
             kv,
@@ -222,13 +270,18 @@ def sparse_attention_backward_wrapper(
     dq: Optional[torch.Tensor] = None,
     dkv: Optional[torch.Tensor] = None,
     block_tile: int = 64,
+    return_cli_target: bool = False,
+    cli_target_head_count: Optional[int] = None,
+    return_preprocess_aux: bool = False,
     stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
-    """High-level wrapper. Returns ``{'dq', 'dkv', 'd_sink'}``.
+    """High-level wrapper, optionally returning ``cli_target`` on SM90.
 
     Dispatches to SM90 or SM100 based on the active CUDA device. The returned
     ``d_sink`` is computed from ``attn_sink`` and ``dout``.
     """
+    if return_cli_target and cli_target_head_count is None:
+        cli_target_head_count = q.shape[1]
     key = (
         q.dtype,
         q.shape,
@@ -241,6 +294,9 @@ def sparse_attention_backward_wrapper(
         topk_length is not None,
         int(block_tile),
         softmax_scale,
+        bool(return_cli_target),
+        cli_target_head_count,
+        bool(return_preprocess_aux),
     )
     obj = _cache_of_SparseAttentionBackwardObjects.get(key)
     if obj is None:
@@ -255,12 +311,15 @@ def sparse_attention_backward_wrapper(
             sample_topk_length=topk_length,
             softmax_scale=softmax_scale,
             block_tile=block_tile,
+            return_cli_target=return_cli_target,
+            cli_target_head_count=cli_target_head_count,
+            return_preprocess_aux=return_preprocess_aux,
         )
         assert obj.check_support()
         obj.compile()
         _cache_of_SparseAttentionBackwardObjects[key] = obj
 
-    dq_out, dkv_out, d_sink_out = obj.execute(
+    outputs = obj.execute(
         q,
         kv,
         out,
@@ -272,6 +331,19 @@ def sparse_attention_backward_wrapper(
         dkv=dkv,
         topk_length=topk_length,
         softmax_scale=softmax_scale,
+        return_cli_target=return_cli_target,
+        cli_target_head_count=cli_target_head_count,
+        return_preprocess_aux=return_preprocess_aux,
         current_stream=stream,
     )
-    return TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)
+    offset = 0
+    dq_out, dkv_out, d_sink_out = outputs[:3]
+    offset = 3
+    result = TupleDict(dq=dq_out, dkv=dkv_out, d_sink=d_sink_out)
+    if return_cli_target:
+        result["cli_target"] = outputs[offset]
+        offset += 1
+    if return_preprocess_aux:
+        result["dpsum"] = outputs[offset]
+        result["lse_log2"] = outputs[offset + 1]
+    return result

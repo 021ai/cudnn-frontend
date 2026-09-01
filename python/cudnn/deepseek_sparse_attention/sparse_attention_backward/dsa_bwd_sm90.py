@@ -413,6 +413,9 @@ class FlashAttentionDSABackwardSm90:
         num_threads: int = 384,
         have_topk_length: bool = True,
         max_topk: int = 0,
+        implicit_local_tokens: int = 0,
+        seqlen_q: int = 0,
+        seqlen_k: int = 0,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -438,6 +441,15 @@ class FlashAttentionDSABackwardSm90:
         self.dQ_swapAB = dQ_swapAB
         self.have_topk_length = have_topk_length
         self.max_topk = max_topk
+        self.implicit_local_tokens = implicit_local_tokens
+        self.seqlen_q = seqlen_q
+        self.seqlen_k = seqlen_k
+        if implicit_local_tokens:
+            assert tile_m == 2 * qhead_per_kvhead, (
+                "implicit-local SM90 backward requires one adjacent query pair per M tile"
+            )
+            assert seqlen_q > 0 and seqlen_q % 2 == 0
+            assert max_topk == implicit_local_tokens + 1
         # wg0 is consumer and producer, wg1 is consumer
         self.num_mma_warp_groups = self.num_threads // 128
 
@@ -655,6 +667,8 @@ class FlashAttentionDSABackwardSm90:
         mdKV: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],  # (batch, seqlen_q, topk_max) fp32
+        cli_target_head_count: Int32,
         softmax_scale: Float32,
         stream: cuda.CUstream,
     ):
@@ -790,6 +804,8 @@ class FlashAttentionDSABackwardSm90:
             mdKV,
             mTopkIdxs,
             mTopkLength,  # sparse KV indices + per-q length
+            mCliTarget,
+            cli_target_head_count,
             tma_atom_Q,
             tma_atom_dO,
             tma_atom_dQ,
@@ -838,6 +854,8 @@ class FlashAttentionDSABackwardSm90:
         mdKV: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topK_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],  # (batch, seqlen_q, topK_max) fp32
+        cli_target_head_count: Int32,
         tma_atom_Q: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
         tma_atom_dQ: cute.CopyAtom,
@@ -936,6 +954,8 @@ class FlashAttentionDSABackwardSm90:
                 mdPsum,
                 mTopkIdxs,
                 mTopkLength,
+                mCliTarget,
+                cli_target_head_count,
                 mdQ,
                 sQ,
                 sKV,
@@ -1004,6 +1024,8 @@ class FlashAttentionDSABackwardSm90:
         mdPsum: cute.Tensor,
         mTopkIdxs: cute.Tensor,  # (batch, seqlen_q, topk_max) int32
         mTopkLength: cute.Tensor,  # (batch, seqlen_q) int32, per-q valid KV count
+        mCliTarget: Optional[cute.Tensor],  # (batch, seqlen_q, topk_max) fp32
+        cli_target_head_count: Int32,
         mdQ: cute.Tensor,
         sQ: cute.Tensor,
         sKV: cute.Tensor,
@@ -1067,6 +1089,10 @@ class FlashAttentionDSABackwardSm90:
         LSEslice = (None, 0) if const_expr(not self.SdP_swapAB) else (0, None)
         tLSEsLSE = make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
         tLSEsdPsum = make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sdPsum_mma))[LSEslice]
+        score_coords = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        tScS = make_acc_tensor_mn_view(
+            thr_mma_SdP.partition_C(score_coords), transpose=self.SdP_swapAB
+        )
 
         # acc_dQ for WG0 — G4_half_0: (64,128), G4_half_1: (64,192)
         dQ_shape_quarter = (self.tile_m, self.hdim_chunk_dq)
@@ -1140,7 +1166,9 @@ class FlashAttentionDSABackwardSm90:
             # The scheduler maps one CTA to exactly one query.
             seq_idx = m_block
 
-            if const_expr(self.have_topk_length):
+            if const_expr(self.implicit_local_tokens > 0):
+                topK = self.implicit_local_tokens + 1
+            elif const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
             else:
                 topK = self.max_topk
@@ -1150,6 +1178,13 @@ class FlashAttentionDSABackwardSm90:
 
             mKV_cur = mKV[None, None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
+            implicit_kv_start = (
+                mKV_cur.shape[0]
+                - self.seqlen_q
+                + seq_idx
+                + 1
+                - self.implicit_local_tokens
+            )
 
             mQ_cur = mQ[None, None, head_idx_kv, seq_idx, batch_idx]
             gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (head_tile, 0))
@@ -1222,14 +1257,21 @@ class FlashAttentionDSABackwardSm90:
                 mma_dsk_fn_1,
                 tLSErLSE,
                 tLSErdPsum,
+                tScS,
                 tPsP,
                 tdSsdS,
                 smem_thr_copy_PdS,
                 softmax_scale_log2,
                 softmax_scale,
+                mCliTarget,
+                cli_target_head_count,
+                batch_idx,
+                seq_idx,
+                topK,
                 dQ_accumulate=False,
                 is_first=True,
                 num_valid_rows=topk_tail_rows,
+                implicit_kv_start=implicit_kv_start,
             )
             n_block -= 1
 
@@ -1251,14 +1293,21 @@ class FlashAttentionDSABackwardSm90:
                     mma_dsk_fn_1,
                     tLSErLSE,
                     tLSErdPsum,
+                    tScS,
                     tPsP,
                     tdSsdS,
                     smem_thr_copy_PdS,
                     softmax_scale_log2,
                     softmax_scale,
+                    mCliTarget,
+                    cli_target_head_count,
+                    batch_idx,
+                    seq_idx,
+                    topK,
                     dQ_accumulate=True,
                     is_first=False,
                     num_valid_rows=self.tile_n,
+                    implicit_kv_start=implicit_kv_start,
                 )
                 n_block -= 1
 
@@ -1303,6 +1352,21 @@ class FlashAttentionDSABackwardSm90:
         global_topk_row: Int32,  # index into topk_idxs
     ):
         token_idx = mTopkIdxs_cur[global_topk_row]
+        self._copy_token_row(
+            mKV_cur, sKV, row, idx_in_group, copy_atom, thr_copy, token_idx
+        )
+
+    @cute.jit
+    def _copy_token_row(
+        self,
+        mKV_cur: cute.Tensor,
+        sKV: cute.Tensor,
+        row: Int32,
+        idx_in_group: Int32,
+        copy_atom: cute.CopyAtom,
+        thr_copy: cute.TiledCopy,
+        token_idx: Int32,
+    ):
         gKV_row = mKV_cur[token_idx, None]
         gKV_chunks = cute.flat_divide(gKV_row, (8,))
         for tile in cutlass.range_constexpr(self.tile_hdim // 64):
@@ -1347,6 +1411,7 @@ class FlashAttentionDSABackwardSm90:
         topK: Int32,  # per-q valid KV count (runtime)
         thr_mma: cute.TiledMma,  # thread's MMA slice
         tidx: Int32,
+        implicit_kv_start: Int32 = 0,
     ):
         """Scatter acc to dKVAccum rows via topK_idx with coalesced float4 atomics.
 
@@ -1370,7 +1435,11 @@ class FlashAttentionDSABackwardSm90:
             local_row = tScDKV_mn[r, 0][ROW]
             global_topk_row = n_block * self.tile_n + local_row
             if global_topk_row < topK:
-                global_kv_row = mTopkIdxs_cur[global_topk_row]
+                global_kv_row = (
+                    implicit_kv_start + global_topk_row
+                    if const_expr(self.implicit_local_tokens > 0)
+                    else mTopkIdxs_cur[global_topk_row]
+                )
                 should_accumulate_dkv = const_expr(True)
                 if const_expr(not self.have_topk_length):
                     should_accumulate_dkv = global_kv_row >= 0
@@ -1409,14 +1478,21 @@ class FlashAttentionDSABackwardSm90:
         mma_dsk_fn_1: Callable,  # G4_half_1: dQ[128:256] RS GEMM
         tLSErLSE: cute.Tensor,
         tLSErdPsum: cute.Tensor,
+        tScS: cute.Tensor,
         tPsP: cute.Tensor,
         tdSsdS: cute.Tensor,
         smem_thr_copy_PdS: cute.TiledCopy,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
+        mCliTarget: Optional[cute.Tensor],
+        cli_target_head_count: Int32,
+        batch_idx: Int32,
+        seq_idx: Int32,
+        topK: Int32,
         dQ_accumulate: Boolean = False,
         is_first: Boolean = True,
         num_valid_rows: Int32 = 64,
+        implicit_kv_start: Int32 = 0,
     ):
         """WG0 one n_block: load KV(cp.async) + GEMM1/2 + softmax/dsoftmax + R2S + GEMM4_WG0(x2)"""
         if not is_first:
@@ -1432,7 +1508,17 @@ class FlashAttentionDSABackwardSm90:
             row = r * NUM_GROUPS + group_idx
             global_topk_row = n_block * self.tile_n + row
             if row < num_valid_rows or not is_first:
-                if const_expr(self.have_topk_length):
+                if const_expr(self.implicit_local_tokens > 0):
+                    self._copy_token_row(
+                        mKV_cur,
+                        sKV,
+                        row,
+                        idx_in_group,
+                        async_copy_atom,
+                        async_thr_copy,
+                        implicit_kv_start + global_topk_row,
+                    )
+                elif const_expr(self.have_topk_length):
                     self._copy_row(
                         mKV_cur,
                         mTopkIdxs_cur,
@@ -1482,7 +1568,36 @@ class FlashAttentionDSABackwardSm90:
         acc_S_mn = make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
+                if const_expr(self.implicit_local_tokens > 0):
+                    query_offset = tScS[r, c][0] // self.qhead_per_kvhead
+                    local_col = n_block * self.tile_n + tScS[r, c][1]
+                    in_window = (
+                        local_col >= query_offset
+                        and local_col < query_offset + self.implicit_local_tokens
+                    )
+                    acc_S_mn[r, c] = (
+                        acc_S_mn[r, c] if in_window else -Float32.inf
+                    )
                 acc_S_mn[r, c] = cute.math.exp2(acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True)
+
+        if const_expr(mCliTarget is not None):
+            # The native backward fragment is M(head) x N(top-k).  Transpose
+            # the register view to N x M, then reuse the same width-4 head
+            # reduction mapping as the standalone SM90 score-recompute kernel.
+            target_nm = make_acc_tensor_mn_view(
+                acc_S, transpose=not self.SdP_swapAB
+            )
+            lane = wg_tidx % 32
+            for r in cutlass.range_constexpr(cute.size(target_nm, mode=[0])):
+                partial = Float32(0.0)
+                for c in cutlass.range(cute.size(target_nm, mode=[1]), unroll_full=True):
+                    partial = partial + target_nm[r, c]
+                partial = warp_reduce(partial, operator.add, width=4)
+                pos = n_block * self.tile_n + r * 8 + (lane >> 2)
+                if (lane & 3) == 0 and pos < topK:
+                    mCliTarget[batch_idx, seq_idx, pos] = (
+                        partial / Float32(cli_target_head_count)
+                    )
 
         # Convert P f32 -> bf16
         tdKVrP = cvt_f16(make_acc_tensor_frgA_view(acc_S), self.dtype)
@@ -1655,7 +1770,9 @@ class FlashAttentionDSABackwardSm90:
 
             seq_idx = m_block
 
-            if const_expr(self.have_topk_length):
+            if const_expr(self.implicit_local_tokens > 0):
+                topK = self.implicit_local_tokens + 1
+            elif const_expr(self.have_topk_length):
                 topK = mTopkLength[batch_idx, seq_idx]
             else:
                 topK = self.max_topk
@@ -1664,6 +1781,13 @@ class FlashAttentionDSABackwardSm90:
             # scatter AtomicAdd — flat gmem dKVaccum for per-row addressing
             mdKVaccum_cur = mdKVaccum[None, head_idx_kv, batch_idx]
             mTopkIdxs_cur = mTopkIdxs[batch_idx, seq_idx, None]
+            implicit_kv_start = (
+                self.seqlen_k
+                - self.seqlen_q
+                + seq_idx
+                + 1
+                - self.implicit_local_tokens
+            )
 
             n_block = n_block_max - 1
             first_iter = True
@@ -1731,6 +1855,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c2 (stage 0, reuse s0): P^T @ dO[128:192] + dS^T @ Q[128:192] ---
@@ -1763,6 +1888,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c3 (stage 1, reuse s1): P^T @ dO[192:256] + dS^T @ Q[192:256] ---
@@ -1795,6 +1921,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c4 (stage 0, reuse s0): P^T @ dO[256:320] + dS^T @ Q[256:320] ---
@@ -1825,6 +1952,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c5 (stage 1, reuse s1): P^T @ dO[320:384] + dS^T @ Q[320:384] ---
@@ -1849,6 +1977,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c6 (stage 0, reuse s0): P^T @ dO[384:448] + dS^T @ Q[384:448] ---
@@ -1873,6 +2002,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 # --- c7 (stage 1, reuse s1): P^T @ dO[448:512] + dS^T @ Q[448:512] ---
@@ -1897,6 +2027,7 @@ class FlashAttentionDSABackwardSm90:
                     topK,
                     thr_mma_dKV,
                     tidx,
+                    implicit_kv_start,
                 )
 
                 if const_expr(not self.same_hdim_kv):
@@ -1926,6 +2057,7 @@ class FlashAttentionDSABackwardSm90:
                         topK,
                         thr_mma_dKV,
                         tidx,
+                        implicit_kv_start,
                     )
                     self.scatter_dkv_atomic(
                         acc_dKV_s0,
@@ -1936,6 +2068,7 @@ class FlashAttentionDSABackwardSm90:
                         topK,
                         thr_mma_dKV,
                         tidx,
+                        implicit_kv_start,
                     )
                 else:
                     # --- d=512: original c7 drain (no c8) ---
@@ -1961,6 +2094,7 @@ class FlashAttentionDSABackwardSm90:
                         topK,
                         thr_mma_dKV,
                         tidx,
+                        implicit_kv_start,
                     )
 
                 n_block -= 1

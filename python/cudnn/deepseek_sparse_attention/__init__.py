@@ -4,6 +4,8 @@
 from importlib import import_module
 
 _SYMBOLS = {
+    "HybridAttentionBackward": (".hybrid_attention_backward", "HybridAttentionBackward"),
+    "hybrid_attention_backward_wrapper": (".hybrid_attention_backward", "hybrid_attention_backward_wrapper"),
     "SparseAttentionBackward": (".sparse_attention_backward", "SparseAttentionBackward"),
     "sparse_attention_backward_wrapper": (".sparse_attention_backward", "sparse_attention_backward_wrapper"),
     "IndexerForward": (".indexer_forward", "IndexerForward"),

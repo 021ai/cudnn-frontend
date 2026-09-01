@@ -44,6 +44,12 @@ def flash_attn_bwd_sm90(
     topk_idxs: torch.Tensor = None,
     topk_length: torch.Tensor = None,
     need_d_sink: bool = False,
+    return_cli_target: bool = False,
+    cli_target_head_count: Optional[int] = None,
+    implicit_local_tokens: int = 0,
+    precomputed_dpsum: Optional[torch.Tensor] = None,
+    precomputed_lse_log2: Optional[torch.Tensor] = None,
+    return_preprocess_aux: bool = False,
     current_stream=None,
 ) -> Tuple[torch.Tensor, ...]:
     """FlashAttention (DSA) Backward Pass for Hopper (SM90), with K=V.
@@ -66,6 +72,8 @@ def flash_attn_bwd_sm90(
         topk_idxs: (total_S_q, topk_max) int32, global indices
         topk_length: (total_S_q,) int32, per-query valid count, optional
         need_d_sink: return and compute d_sink when True
+        return_cli_target: additionally return the head-reduced CLI teacher target
+        cli_target_head_count: number of real attention heads before padding
 
     Returns:
         (dq, dkv) or (dq, dkv, d_sink) — flat layout gradients
@@ -84,6 +92,16 @@ def flash_attn_bwd_sm90(
     out4 = out.unsqueeze(0)  # (1, total_S_q, H, D_v)
     dout4 = dout.unsqueeze(0)  # (1, total_S_q, H, D_v)
     lse4 = lse.unsqueeze(0)  # (1, total_S_q, H)
+    if implicit_local_tokens:
+        if total_S_q % 2 or num_head * 2 != 64:
+            raise ValueError(
+                "SM90 implicit-local backward requires an even query length and 32 heads"
+            )
+        if topk_idxs is None or topk_idxs.dtype != torch.int32:
+            raise ValueError(
+                "implicit-local backward requires an int32 metadata tensor; "
+                "its values are not read"
+            )
     topk4 = topk_idxs.unsqueeze(0) if topk_idxs is not None else None  # (1, total_S_q, TopK)
     tlen4 = topk_length.unsqueeze(0) if topk_length is not None else None  # (1, total_S_q)
 
@@ -139,23 +157,73 @@ def flash_attn_bwd_sm90(
         else:
             d_sink.fill_(0)
     write_d_sink = sink_enabled and return_d_sink
+    cli_target = None
+    if return_cli_target:
+        if num_head != m_block_size:
+            raise ValueError(
+                "SM90 CLI target fusion requires exactly one padded 64-head block, "
+                f"got {num_head} heads"
+            )
+        if cli_target_head_count is None:
+            cli_target_head_count = num_head
+        if not 0 < cli_target_head_count <= num_head:
+            raise ValueError(
+                "cli_target_head_count must be in (0, num_head], got "
+                f"{cli_target_head_count} for num_head={num_head}"
+            )
+        cli_target = torch.zeros(
+            batch_size,
+            seqlen_q,
+            topk4.shape[-1],
+            dtype=torch.float32,
+            device=device,
+        )
+    else:
+        cli_target_head_count = 0
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
-    dpsum = torch.empty(
-        batch_size,
-        seqlen_q_rounded,
-        num_head,
-        dtype=torch.float32,
-        device=device,
-    )
-    lse_log2 = torch.empty(
-        batch_size,
-        seqlen_q_rounded,
-        num_head,
-        dtype=torch.float32,
-        device=device,
-    )
+    if (precomputed_dpsum is None) != (precomputed_lse_log2 is None):
+        raise ValueError(
+            "precomputed_dpsum and precomputed_lse_log2 must be provided together"
+        )
+    reuse_preprocess = precomputed_dpsum is not None
+    if reuse_preprocess:
+        expected_aux_shape = (batch_size, seqlen_q_rounded, num_head)
+        if tuple(precomputed_dpsum.shape) != expected_aux_shape:
+            raise ValueError(
+                f"precomputed_dpsum must have shape {expected_aux_shape}, "
+                f"got {tuple(precomputed_dpsum.shape)}"
+            )
+        if tuple(precomputed_lse_log2.shape) != expected_aux_shape:
+            raise ValueError(
+                f"precomputed_lse_log2 must have shape {expected_aux_shape}, "
+                f"got {tuple(precomputed_lse_log2.shape)}"
+            )
+        if (
+            precomputed_dpsum.dtype != torch.float32
+            or precomputed_lse_log2.dtype != torch.float32
+        ):
+            raise ValueError("precomputed backward auxiliaries must use float32")
+        if precomputed_dpsum.device != device or precomputed_lse_log2.device != device:
+            raise ValueError("precomputed backward auxiliaries must be on the Q device")
+        dpsum = precomputed_dpsum
+        lse_log2 = precomputed_lse_log2
+    else:
+        dpsum = torch.empty(
+            batch_size,
+            seqlen_q_rounded,
+            num_head,
+            dtype=torch.float32,
+            device=device,
+        )
+        lse_log2 = torch.empty(
+            batch_size,
+            seqlen_q_rounded,
+            num_head,
+            dtype=torch.float32,
+            device=device,
+        )
 
     if dkv_accum is None:
         dkv_accum = torch.zeros(
@@ -174,65 +242,72 @@ def flash_attn_bwd_sm90(
     num_threads = 256
 
     # --- preprocess ---
-    compile_key_pre = (
-        dtype,
-        head_dim_v,
-        m_block_size,
-        num_threads,
-        sink_enabled,
-        write_d_sink,
-    )
-    if compile_key_pre not in flash_attn_bwd_sm90.compile_cache_pre:
-        o_tensor, do_tensor = [to_cute_tensor(t) for t in (out4, dout4)]
-        dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dpsum, lse_log2)]
-        lse_tensor = to_cute_tensor(lse4, assumed_align=4)
-        attn_sink_tensor = to_cute_tensor(attn_sink) if sink_enabled else None
-        d_sink_tensor = to_cute_tensor(d_sink) if write_d_sink else None
-        fa_bwd_pre = _FlashAttentionDSABackwardPreprocessSm90(
+    # HFA's explicit and local branches consume the same full-attention O/dO
+    # and LSE.  The sequential HFA wrapper exports these auxiliaries from the
+    # first branch and supplies them to the second branch, avoiding a duplicate
+    # O*dO reduction and LSE conversion.
+    if not reuse_preprocess:
+        compile_key_pre = (
             dtype,
             head_dim_v,
-            arch,
             m_block_size,
-            num_threads=num_threads,
+            num_threads,
+            sink_enabled,
+            write_d_sink,
         )
-        flash_attn_bwd_sm90.compile_cache_pre[compile_key_pre] = cute.compile(
-            fa_bwd_pre,
-            o_tensor,
-            do_tensor,
-            dpsum_tensor,
-            lse_tensor,
-            lse_log2_tensor,
-            attn_sink_tensor,
-            d_sink_tensor,
+        if compile_key_pre not in flash_attn_bwd_sm90.compile_cache_pre:
+            o_tensor, do_tensor = [to_cute_tensor(t) for t in (out4, dout4)]
+            dpsum_tensor, lse_log2_tensor = [to_cute_tensor(t) for t in (dpsum, lse_log2)]
+            lse_tensor = to_cute_tensor(lse4, assumed_align=4)
+            attn_sink_tensor = to_cute_tensor(attn_sink) if sink_enabled else None
+            d_sink_tensor = to_cute_tensor(d_sink) if write_d_sink else None
+            fa_bwd_pre = _FlashAttentionDSABackwardPreprocessSm90(
+                dtype,
+                head_dim_v,
+                arch,
+                m_block_size,
+                num_threads=num_threads,
+            )
+            flash_attn_bwd_sm90.compile_cache_pre[compile_key_pre] = cute.compile(
+                fa_bwd_pre,
+                o_tensor,
+                do_tensor,
+                dpsum_tensor,
+                lse_tensor,
+                lse_log2_tensor,
+                attn_sink_tensor,
+                d_sink_tensor,
+                None,
+                None,
+                None,
+                current_stream,
+                options="--enable-tvm-ffi",
+            )
+        flash_attn_bwd_sm90.compile_cache_pre[compile_key_pre](
+            out4,
+            dout4,
+            dpsum,
+            lse4,
+            lse_log2,
+            attn_sink if sink_enabled else None,
+            d_sink if write_d_sink else None,
             None,
             None,
             None,
             current_stream,
-            options="--enable-tvm-ffi",
         )
-    flash_attn_bwd_sm90.compile_cache_pre[compile_key_pre](
-        out4,
-        dout4,
-        dpsum,
-        lse4,
-        lse_log2,
-        attn_sink if sink_enabled else None,
-        d_sink if write_d_sink else None,
-        None,
-        None,
-        None,
-        current_stream,
-    )
 
     # --- main kernel ---
     assert topk4 is not None
     assert topk4.dtype == torch.int32
-    have_topk_length = tlen4 is not None
+    have_topk_length = tlen4 is not None and not implicit_local_tokens
     if have_topk_length:
         assert tlen4.dtype == torch.int32
     else:
         tlen4 = torch.empty(1, dtype=torch.int32, device=device)
-    max_topk = topk4.shape[-1]
+    max_topk = (
+        implicit_local_tokens + 1 if implicit_local_tokens else topk4.shape[-1]
+    )
 
     num_threads = 256
     compile_key = (
@@ -252,6 +327,11 @@ def flash_attn_bwd_sm90(
         dQ_swapAB,
         have_topk_length,
         max_topk,
+        return_cli_target,
+        cli_target_head_count,
+        implicit_local_tokens,
+        seqlen_q,
+        seqlen_k,
     )
     if compile_key not in flash_attn_bwd_sm90.compile_cache:
         q_tensor = to_cute_tensor(q4)
@@ -262,6 +342,7 @@ def flash_attn_bwd_sm90(
         dkv_accum_tensor = to_cute_tensor(dkv_accum)
         topk_idxs_tensor = to_cute_tensor(topk4)
         topk_length_tensor = to_cute_tensor(tlen4)
+        cli_target_tensor = to_cute_tensor(cli_target) if return_cli_target else None
 
         fa_bwd_obj = FlashAttentionDSABackwardSm90(
             dtype,
@@ -278,6 +359,9 @@ def flash_attn_bwd_sm90(
             num_threads=num_threads,
             have_topk_length=have_topk_length,
             max_topk=max_topk,
+            implicit_local_tokens=implicit_local_tokens,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
         )
         flash_attn_bwd_sm90.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
@@ -290,6 +374,8 @@ def flash_attn_bwd_sm90(
             dkv_accum_tensor,
             topk_idxs_tensor,
             topk_length_tensor,
+            cli_target_tensor,
+            cli_target_head_count,
             softmax_scale,
             current_stream,
             options="--enable-tvm-ffi",
@@ -305,6 +391,8 @@ def flash_attn_bwd_sm90(
             dkv_accum,
             topk4,
             tlen4,
+            cli_target,
+            cli_target_head_count,
             softmax_scale,
             current_stream,
         )
@@ -350,9 +438,12 @@ def flash_attn_bwd_sm90(
     )
 
     # dq / dkv are already the flat tensors (unsqueeze was a view)
-    if return_d_sink:
-        return dq, dkv, d_sink
-    return dq, dkv
+    outputs = (dq, dkv, d_sink) if return_d_sink else (dq, dkv)
+    if return_cli_target:
+        outputs = (*outputs, cli_target.squeeze(0))
+    if return_preprocess_aux:
+        outputs = (*outputs, dpsum, lse_log2)
+    return outputs
 
 
 flash_attn_bwd_sm90.compile_cache_pre = {}
